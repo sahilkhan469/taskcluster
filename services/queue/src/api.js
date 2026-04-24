@@ -986,13 +986,8 @@ builder.declare({
   // Same as above but for tasks with no dependencies, scheduling the first run.
   let runZeroState = (task.runs[runId] || { state: 'unscheduled' }).state;
   if (runZeroState === 'pending') {
-    await Promise.all([
-      // Put message into the task pending queue
-      this.queueService.putPendingMessage(task, runId),
-
-      // Publish message to pulse
-      this.publisher.taskPending({ status, task: taskPulseContents, runId }, task.routes),
-    ]);
+    // queue_pending_tasks insert is now atomic inside schedule_task (db v124).
+    await this.publisher.taskPending({ status, task: taskPulseContents, runId }, task.routes);
     this.monitor.log.taskPending({ taskId, runId });
   }
 
@@ -1159,14 +1154,12 @@ builder.declare({
   let status = task.status();
   if (state === 'pending') {
     let runId = task.runs.length - 1;
-    await Promise.all([
-      this.queueService.putPendingMessage(task, runId),
-      this.publisher.taskPending({
-        status: status,
-        runId: runId,
-        task: { tags: task.tags || {} },
-      }, task.routes),
-    ]);
+    // queue_pending_tasks insert is now atomic inside schedule_task / rerun_task (db v124).
+    await this.publisher.taskPending({
+      status: status,
+      runId: runId,
+      task: { tags: task.tags || {} },
+    }, task.routes);
     this.monitor.log.taskPending({ taskId, runId });
   }
 
@@ -1999,14 +1992,12 @@ builder.declare({
       newRun.state === 'pending' &&
       (newRun.reasonCreated === 'retry' ||
        newRun.reasonCreated === 'task-retry')) {
-    await Promise.all([
-      this.queueService.putPendingMessage(task, runId + 1),
-      this.publisher.taskPending({
-        status,
-        task: taskPulseContents,
-        runId: runId + 1,
-      }, task.routes),
-    ]);
+    // queue_pending_tasks insert is now atomic inside resolve_task (db v124).
+    await this.publisher.taskPending({
+      status,
+      task: taskPulseContents,
+      runId: runId + 1,
+    }, task.routes);
     this.monitor.log.taskPending({ taskId, runId: runId + 1 });
   } else {
     // Update dependency tracker, as the task is resolved (no new run)

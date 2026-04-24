@@ -275,14 +275,12 @@ class DependencyTracker {
     // Put message into pending queue, and publish message to pulse,
     // if the initial run is pending
     if (task.runs && task.runs[0].state === 'pending') {
-      await Promise.all([
-        this.queueService.putPendingMessage(task, 0),
-        this.publisher.taskPending({
-          status: status,
-          runId: 0,
-          task: { tags: task.tags || {} },
-        }, task.routes),
-      ]);
+      // queue_pending_tasks insert is now atomic inside schedule_task (db v124).
+      await this.publisher.taskPending({
+        status: status,
+        runId: 0,
+        task: { tags: task.tags || {} },
+      }, task.routes);
       this.monitor.log.taskPending({ taskId: task.taskId, runId: 0 });
     }
 

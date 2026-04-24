@@ -168,14 +168,12 @@ class ClaimResolver {
         task.runs.length - 1 === runId + 1 &&
         newRun.state === 'pending' &&
         newRun.reasonCreated === 'retry') {
-      await Promise.all([
-        this.queueService.putPendingMessage(task, runId + 1),
-        this.publisher.taskPending({
-          status: status,
-          runId: runId + 1,
-          task: { tags: task.tags || {} },
-        }, task.routes),
-      ]);
+      // queue_pending_tasks insert is now atomic inside check_task_claim (db v124).
+      await this.publisher.taskPending({
+        status: status,
+        runId: runId + 1,
+        task: { tags: task.tags || {} },
+      }, task.routes);
       this.monitor.log.taskPending({ taskId, runId: runId + 1 });
     } else {
       // Update dependencyTracker
