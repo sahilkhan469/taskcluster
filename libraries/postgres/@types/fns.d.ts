@@ -3226,6 +3226,16 @@ type QueueQueuePendingTasksAddFn = {
   expires_in: any;
  }): Promise<void>;
 };
+type QueueQueuePendingTasksAddForTaskFn = {
+ (
+   task_id_in: string,
+   run_id_in: number
+ ): Promise<void>;
+ (params: {
+  task_id_in: string;
+  run_id_in: number;
+ }): Promise<void>;
+};
 type QueueQueuePendingTasksCountFn = {
  (
    task_queue_id_in: string
@@ -6341,6 +6351,7 @@ export interface DbFunctions {
   queue_claimed_tasks_count: QueueQueueClaimedTasksCountFn;
   queue_pending_task_delete: QueueQueuePendingTaskDeleteFn;
   queue_pending_tasks_add: QueueQueuePendingTasksAddFn;
+  queue_pending_tasks_add_for_task: QueueQueuePendingTasksAddForTaskFn;
   queue_pending_tasks_count: QueueQueuePendingTasksCountFn;
   queue_pending_tasks_delete: QueueQueuePendingTasksDeleteFn;
   queue_pending_tasks_delete_expired: QueueQueuePendingTasksDeleteExpiredFn;

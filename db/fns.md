@@ -124,6 +124,7 @@
    * [`queue_claimed_tasks_count`](#queue_claimed_tasks_count)
    * [`queue_pending_task_delete`](#queue_pending_task_delete)
    * [`queue_pending_tasks_add`](#queue_pending_tasks_add)
+   * [`queue_pending_tasks_add_for_task`](#queue_pending_tasks_add_for_task)
    * [`queue_pending_tasks_count`](#queue_pending_tasks_count)
    * [`queue_pending_tasks_delete`](#queue_pending_tasks_delete)
    * [`queue_pending_tasks_delete_expired`](#queue_pending_tasks_delete_expired)
@@ -2882,6 +2883,7 @@ end
 * [`queue_claimed_tasks_count`](#queue_claimed_tasks_count)
 * [`queue_pending_task_delete`](#queue_pending_task_delete)
 * [`queue_pending_tasks_add`](#queue_pending_tasks_add)
+* [`queue_pending_tasks_add_for_task`](#queue_pending_tasks_add_for_task)
 * [`queue_pending_tasks_count`](#queue_pending_tasks_count)
 * [`queue_pending_tasks_delete`](#queue_pending_tasks_delete)
 * [`queue_pending_tasks_delete_expired`](#queue_pending_tasks_delete_expired)
@@ -3130,11 +3132,15 @@ end
   * `retries_left integer`
   * `runs jsonb`
   * `taken_until timestamptz`
-* *Last defined on version*: 28
+* *Last defined on version*: 124
 
 Check the given task for a claim on the given run expiring at the given
 time.  If the run is still running, it is marked as claim-expired and
-a retry scheduled (if retries_left).
+a retry scheduled (if retries_left).  When a retry run is scheduled, it
+is also atomically enqueued into queue_pending_tasks via
+queue_pending_tasks_add_for_task, so a Pulse-publish failure in the JS
+caller (claimresolver) can no longer leave the retry pending in
+tasks.runs but missing from the workers' claimable queue.
 
 This returns the task's updated status, or nothing if the current status
 was not as expected.
@@ -3147,7 +3153,8 @@ declare
   runs jsonb;
   run jsonb;
   new_runs jsonb;
-  new_taken_until timestamptz;
+  added_retry boolean := false;
+  new_run_id int;
 begin
   -- lock the task row to prevent concurrent updates
   select tasks.retries_left, tasks.runs, tasks.deadline
@@ -3199,6 +3206,7 @@ begin
         'reasonCreated', 'retry',
         'scheduled', now()));
     task.retries_left = task.retries_left - 1;
+    added_retry := true;
   end if;
 
   update tasks
@@ -3207,6 +3215,11 @@ begin
     runs = new_runs,
     taken_until = null
   where tasks.task_id = check_task_claim.task_id;
+
+  if added_retry then
+    new_run_id := jsonb_array_length(new_runs) - 1;
+    perform queue_pending_tasks_add_for_task(check_task_claim.task_id, new_run_id);
+  end if;
 
   return query
   select tasks.retries_left, tasks.runs, tasks.taken_until
@@ -5185,6 +5198,80 @@ end
 
 </details>
 
+### queue_pending_tasks_add_for_task
+
+* *Mode*: write
+* *Arguments*:
+  * `task_id_in text`
+  * `run_id_in integer`
+* *Returns*: `void`
+* *Last defined on version*: 124
+
+Enqueue a pending task run into queue_pending_tasks atomically with its
+caller. Intended to be called from DB functions that transition a run to
+`pending` (schedule_task, rerun_task, resolve_task, check_task_claim).
+Reads task_queue_id, priority, and deadline from the `tasks` row,
+generates a hint_id, and delegates to queue_pending_tasks_add (which does
+the INSERT ... ON CONFLICT DO UPDATE and NOTIFY task_pending).
+
+Callers are expected to already hold a FOR UPDATE lock on the tasks row
+for task_id_in (the four DB fns listed above lock the row at the top of
+their bodies). The re-read here is for convenience, not locking.
+
+<details><summary>Function Body</summary>
+
+```
+declare
+  t_task_queue_id text;
+  t_priority task_priority;
+  t_deadline timestamptz;
+  priority_int integer;
+begin
+  -- Caller holds FOR UPDATE on this row; the read is a convenience,
+  -- not a locking operation.
+  select tasks.task_queue_id, tasks.priority, tasks.deadline
+    into t_task_queue_id, t_priority, t_deadline
+    from tasks
+    where tasks.task_id = task_id_in;
+
+  if t_task_queue_id is null then
+    return;
+  end if;
+
+  -- Skip if the task's deadline has already passed; the deadline
+  -- resolver will resolve it as `deadline-exceeded`. Matches the
+  -- pre-fix JS behavior of `QueueService.putPendingMessage`.
+  if t_deadline < now() then
+    return;
+  end if;
+
+  -- This mapping is duplicated in `PRIORITY_TO_CONSTANT` in
+  -- `services/queue/src/queueservice.js`. If you add or reorder
+  -- priority tiers, update both.
+  priority_int := case t_priority
+    when 'highest'   then 7
+    when 'very-high' then 6
+    when 'high'      then 5
+    when 'medium'    then 4
+    when 'low'       then 3
+    when 'very-low'  then 2
+    when 'lowest'    then 1
+    else 0
+  end;
+
+  perform queue_pending_tasks_add(
+    t_task_queue_id,
+    priority_int,
+    task_id_in,
+    run_id_in,
+    public.gen_random_uuid()::text,
+    t_deadline::timestamp
+  );
+end
+```
+
+</details>
+
 ### queue_pending_tasks_count
 
 * *Mode*: read
@@ -5859,13 +5946,16 @@ end
   * `retries_left integer`
   * `runs jsonb`
   * `taken_until timestamptz`
-* *Last defined on version*: 28
+* *Last defined on version*: 124
 
 Ensure that no run is currently running or pending, and then create a new
 pending run with the given reason.  This also resets the retries_left
 column to `retries` (unless the sanity-check maximum runs has been
-reached).  This returns the task's updated status, or nothing if the
-current status was not as expected.
+reached).  The new pending run is also atomically enqueued into
+queue_pending_tasks via queue_pending_tasks_add_for_task, so a Pulse-publish
+failure in the JS caller can no longer leave the rerun invisible to workers.
+This returns the task's updated status, or nothing if the current status was
+not as expected.
 
 <details><summary>Function Body</summary>
 
@@ -5874,6 +5964,7 @@ declare
   runs jsonb;
   run jsonb;
   last_run_id int;
+  new_run_id int;
   max_runs_allowed constant int = 50;
 begin
   -- lock the task row to prevent concurrent updates
@@ -5902,6 +5993,8 @@ begin
     return;
   end if;
 
+  new_run_id := last_run_id + 1;
+
   update tasks
   set
     retries_left = least(tasks.retries, max_runs_allowed - last_run_id - 2),
@@ -5912,6 +6005,8 @@ begin
         'scheduled', now())),
     taken_until = null
   where tasks.task_id = rerun_task.task_id;
+
+  perform queue_pending_tasks_add_for_task(rerun_task.task_id, new_run_id);
 
   return query
   select tasks.retries_left, tasks.runs, tasks.taken_until
@@ -5935,13 +6030,18 @@ end
   * `retries_left integer`
   * `runs jsonb`
   * `taken_until timestamptz`
-* *Last defined on version*: 28
+* *Last defined on version*: 124
 
 Resolve the given run with the given state and reason, setting
 run.resolved and resetting `taken_until`.  If `retry_reason` is not null
 and there are `retries_left`, a new pending run is added, and
-`retries_left` is decremented.  This returns the task's updated status,
-or nothing if the current status was not as expected.
+`retries_left` is decremented.  When a retry run is added, it is also
+atomically enqueued into queue_pending_tasks via
+queue_pending_tasks_add_for_task, so a Pulse-publish failure in the JS
+caller (e.g. reportException, workerremovedresolver) can no longer leave
+the retry pending in tasks.runs but missing from the workers' claimable
+queue.  This returns the task's updated status, or nothing if the current
+status was not as expected.
 
 <details><summary>Function Body</summary>
 
@@ -5950,7 +6050,8 @@ declare
   task record;
   run jsonb;
   new_runs jsonb;
-  new_taken_until timestamptz;
+  added_retry boolean := false;
+  new_run_id int;
 begin
   -- lock the task row to prevent concurrent updates
   select tasks.retries_left, tasks.runs
@@ -5990,6 +6091,7 @@ begin
         'reasonCreated', retry_reason,
         'scheduled', now()));
     task.retries_left = task.retries_left - 1;
+    added_retry := true;
   end if;
 
   update tasks
@@ -5998,6 +6100,11 @@ begin
     runs = new_runs,
     taken_until = null
   where tasks.task_id = resolve_task.task_id;
+
+  if added_retry then
+    new_run_id := jsonb_array_length(new_runs) - 1;
+    perform queue_pending_tasks_add_for_task(resolve_task.task_id, new_run_id);
+  end if;
 
   return query
   select tasks.retries_left, tasks.runs, tasks.taken_until
@@ -6137,9 +6244,13 @@ end
   * `retries_left integer`
   * `runs jsonb`
   * `taken_until timestamptz`
-* *Last defined on version*: 28
+* *Last defined on version*: 124
 
 Schedule the initial run for a task, moving the task from "unscheduled" to "pending".
+Also atomically enqueues the new pending run into queue_pending_tasks via
+queue_pending_tasks_add_for_task, so a Pulse-publish failure in the JS caller
+can no longer leave a task pending in tasks.runs but missing from the workers'
+claimable queue.
 This returns the task's updated status, or nothing if the current status was not
 as expected.
 
@@ -6176,6 +6287,12 @@ begin
         'scheduled', now())),
     taken_until = null
   where tasks.task_id = schedule_task.task_id;
+
+  -- Reached only after the UPDATE ran (all earlier branches `return`
+  -- without modifying tasks.runs). If you add an early-return below
+  -- the UPDATE above, move this PERFORM into the UPDATE's success
+  -- path to keep the tasks.runs / queue_pending_tasks invariant.
+  perform queue_pending_tasks_add_for_task(schedule_task.task_id, 0);
 
   return query
   select tasks.retries_left, tasks.runs, tasks.taken_until
