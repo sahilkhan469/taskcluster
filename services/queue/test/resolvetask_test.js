@@ -497,4 +497,64 @@ helper.secrets.mockSuite(testing.suiteName(), ['aws'], function(mock, skipping) 
       m.payload.status.runs[1].state === 'exception' &&
       m.payload.status.runs.length === 2));
   });
+
+  test('regression: pulse taskPending failure during reportException retry does not orphan the retry run', async function() {
+    const taskId = slugid.v4();
+
+    debug('### Creating task');
+    await helper.queue.createTask(taskId, taskDef);
+    helper.assertPulseMessage('task-defined');
+    helper.assertPulseMessage('task-pending');
+
+    debug('### Claiming task');
+    await helper.queue.claimTask(taskId, 0, {
+      workerGroup: 'my-worker-group-extended-extended',
+      workerId: 'my-worker-extended-extended',
+    });
+    helper.assertPulseMessage('task-running');
+    helper.clearPulseMessages();
+
+    // Intercept all pulse publishes at the FakeClient level.
+    // Any message on the task-pending exchange will throw, simulating Pulse unavailability.
+    // Messages on other exchanges (task-exception, task-running, etc.) succeed normally.
+    helper.onPulsePublish(async (exchange) => {
+      if (exchange.endsWith('/task-pending')) {
+        throw new Error('pulse-unavailable-test-injected-fault');
+      }
+    });
+
+    let publisherError = null;
+    try {
+      // The API call should fail because taskPending publish throws after the DB commit.
+      try {
+        await helper.queue.use({ retries: 0 }).reportException(taskId, 0, { reason: 'worker-shutdown' });
+      } catch (err) {
+        publisherError = err;
+        // Expect an error referencing the injected fault or a wrapped InternalServerError
+        if (!err.toString().match(/pulse-unavailable-test-injected-fault|InternalServerError/i)) {
+          throw err;
+        }
+      }
+      assert(publisherError, 'reportException should have thrown because taskPending publisher was stubbed to fail');
+
+      // Clear the monitor error recorded by the API's 500 handler so the
+      // teardown's error-level check doesn't fail the test.
+      monitor.manager.reset();
+
+      // Despite the Pulse failure, the DB-level atomic enqueue means
+      // queue_pending_tasks already has run_id=1 for this task.
+      const rows = await helper.withDbClient(async client => {
+        const result = await client.query(
+          'select run_id from queue_pending_tasks where task_id = $1',
+          [taskId],
+        );
+        return result.rows;
+      });
+      assert.equal(rows.length, 1, 'retry run must be atomically enqueued in queue_pending_tasks by resolve_task');
+      assert.equal(rows[0].run_id, 1, 'the enqueued retry run must have run_id=1');
+    } finally {
+      // Reset the pulse publish hook so subsequent tests are unaffected.
+      helper.onPulsePublish();
+    }
+  });
 });
